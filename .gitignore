@@ -1,0 +1,6 @@
+conda-env
+naive
+naive-cuda
+blas
+openmp
+__pycache__
