@@ -8,13 +8,16 @@ blas: blas.cpp
 	g++ -O3 -march=native -o blas blas.cpp -lblas
 
 naive-cuda: naive-cuda.cu
-	nvcc -O3  -o naive-cuda naive-cuda.cu
+	nvcc -O3 -o naive-cuda naive-cuda.cu
+
+tiled-cuda: tiled.cu
+	nvcc -O3 -o tiled-cuda tiled.cu
 
 .PHONY: clean all format
 
-all: naive openmp blas naive-cuda
+all: naive openmp blas naive-cuda tiled-cuda
 
 format:
 	clang-format -i -style=Google *.cpp *.cu
 clean:
-	rm -f naive openmp blas naive-cuda
+	rm -f naive openmp blas naive-cuda tiled-cuda
