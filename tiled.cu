@@ -28,25 +28,26 @@ vector<float> naive_matrix_multiply(const vector<float> &m1,
   return result;
 }
 
-#define TILE_SIZE 32
+extern __shared__ float shared[];
 __global__ void tiled_matrix_multiply_kernel(float *m1, float *m2,
-                                             float *result, int n) {
-  __shared__ float shared_m1[TILE_SIZE][TILE_SIZE];
-  __shared__ float shared_m2[TILE_SIZE][TILE_SIZE];
+                                             float *result, int n,
+                                             size_t tile_size) {
+  float *shared_m1 = shared;
+  float *shared_m2 = shared + tile_size * tile_size;
 
   int tx = threadIdx.x, ty = threadIdx.y;
 
-  int row = blockIdx.y * TILE_SIZE + ty;
-  int col = blockIdx.x * TILE_SIZE + tx;
+  int row = blockIdx.y * tile_size + ty;
+  int col = blockIdx.x * tile_size + tx;
 
   float sum = 0;
-  for (int tile = 0; tile < n / TILE_SIZE; ++tile) {
-    shared_m1[ty][tx] = m1[row * n + (tile * TILE_SIZE + tx)];
-    shared_m2[ty][tx] = m2[(tile * TILE_SIZE + ty) * n + col];
+  for (int tile = 0; tile < n / tile_size; ++tile) {
+    shared_m1[ty * tile_size + tx] = m1[row * n + (tile * tile_size + tx)];
+    shared_m2[ty * tile_size + tx] = m2[(tile * tile_size + ty) * n + col];
     __syncthreads();
 
-    for (int k = 0; k < TILE_SIZE; ++k) {
-      sum += shared_m1[ty][k] * shared_m2[k][tx];
+    for (int k = 0; k < tile_size; ++k) {
+      sum += shared_m1[ty * tile_size + k] * shared_m2[k * tile_size + tx];
     }
     __syncthreads();
   }
@@ -57,20 +58,24 @@ __global__ void tiled_matrix_multiply_kernel(float *m1, float *m2,
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 3) {
-    cerr << "Usage: " << argv[0] << " <size> <runs>\n";
+  if (argc != 4) {
+    cerr << "Usage: " << argv[0] << " <size> <runs> <tile_size>\n";
     return EXIT_FAILURE;
   }
 
   try {
     int size = stoi(argv[1]);
     int runs = stoi(argv[2]);
+    int tile_size = stoi(argv[3]);
 
     if (size <= 0) {
       throw invalid_argument("Size must be a positive integer.");
     }
     if (runs <= 0) {
       throw invalid_argument("Number of runs must be a positive integer.");
+    }
+    if (tile_size <= 0) {
+      throw invalid_argument("Tile size must be a positive integer.");
     }
 
     vector<float> m1 = create_random_matrix(size),
@@ -86,23 +91,31 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_m2, m2.data(), size * size * sizeof(float),
                cudaMemcpyHostToDevice);
 
-    if (size % TILE_SIZE != 0) {
-      throw invalid_argument("Size must be divisible by TILE_SIZE.");
+    if (size % tile_size != 0) {
+      throw invalid_argument("Size must be divisible by tile_size.");
     }
 
     // Define grid and block dimensions
-    dim3 blockDim(TILE_SIZE, TILE_SIZE);
+    dim3 blockDim(tile_size, tile_size);
     dim3 gridDim((size + blockDim.x - 1) / blockDim.x,
                  (size + blockDim.y - 1) / blockDim.y);
+    size_t shared_mem_size = tile_size * tile_size * sizeof(float) * 2;
 
-    if (size < 1000) {
+    // Check if device has enough shared memory
+    cudaDeviceProp device_prop;
+    cudaGetDeviceProperties(&device_prop, 0);
+    if (shared_mem_size > device_prop.sharedMemPerBlock) {
+      throw runtime_error("Device does not have enough shared memory.");
+    }
+
+    if (size <= 1024) {
       // Check if lines up with CUDA implementation up to floating point error
       vector<float> naive_result = naive_matrix_multiply(m1, m2, size);
       vector<float> cuda_result(size * size);
 
       // Run CUDA kernel
-      tiled_matrix_multiply_kernel<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                          size);
+      tiled_matrix_multiply_kernel<<<gridDim, blockDim, shared_mem_size>>>(
+          d_m1, d_m2, d_result, size, tile_size);
       cudaDeviceSynchronize();
 
       // Copy result back to host
@@ -122,22 +135,23 @@ int main(int argc, char *argv[]) {
 
     // Warmup
     for (int i = 0; i < 10; ++i) {
-      tiled_matrix_multiply_kernel<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                          size);
+      tiled_matrix_multiply_kernel<<<gridDim, blockDim, shared_mem_size>>>(
+          d_m1, d_m2, d_result, size, tile_size);
       cudaDeviceSynchronize();
     }
 
     cout << "size,run,runtime_us,method" << endl;
     for (int i = 0; i < runs; ++i) {
       auto start_time = chrono::high_resolution_clock::now();
-      tiled_matrix_multiply_kernel<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                          size);
+      tiled_matrix_multiply_kernel<<<gridDim, blockDim, shared_mem_size>>>(
+          d_m1, d_m2, d_result, size, tile_size);
       cudaDeviceSynchronize();
       auto end_time = chrono::high_resolution_clock::now();
       auto duration =
           chrono::duration_cast<chrono::microseconds>(end_time - start_time)
               .count();
-      cout << size << "," << i + 1 << "," << duration << ",naive_cuda" << endl;
+      cout << size << "," << i + 1 << "," << duration
+           << ",tiled_cuda(tile_size=" << tile_size << ")" << endl;
     }
 
     // Clean up
