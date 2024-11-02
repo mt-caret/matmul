@@ -1,4 +1,5 @@
-#include <cblas.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <iostream>
@@ -17,14 +18,61 @@ vector<float> create_random_matrix(int n) {
   return matrix;
 }
 
-vector<float> blas_matrix_multiply(const vector<float> &m1,
-                                   const vector<float> &m2, int n) {
-  vector<float> result(n * n);
+void cublas_matrix_multiply(cublasHandle_t handle, float *d_m1, float *d_m2,
+                            float *d_result, int n) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
 
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f,
-              m1.data(), n, m2.data(), n, 0.0f, result.data(), n);
+  // Run CUDA kernel. We swap the ordering of m1 and m2, which are in row-major
+  // order, which on computation in column-major order (which cublas assumes)
+  // will result in the correct result when interpreted in row-major order.
+  // c.f. https://stackoverflow.com/a/56064726
+  checkCublasErrors(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                &alpha, d_m2, n, d_m1, n, &beta, d_result, n));
+  checkCudaErrors(cudaDeviceSynchronize());
+}
 
-  return result;
+vector<float> cublas_matrix_multiply_and_return(const vector<float> &m1,
+                                                const vector<float> &m2,
+                                                int n) {
+  float *d_m1, *d_m2, *d_result;
+  cublasHandle_t handle;
+  checkCublasErrors(cublasCreate(&handle));
+
+  checkCudaErrors(cudaMalloc(&d_m1, n * n * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_m2, n * n * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_result, n * n * sizeof(float)));
+  checkCudaErrors(cudaMemcpy(d_m1, m1.data(), n * n * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(d_m2, m2.data(), n * n * sizeof(float),
+                             cudaMemcpyHostToDevice));
+
+  vector<float> cuda_result(n * n);
+
+  cublas_matrix_multiply(handle, d_m1, d_m2, d_result, n);
+
+  // Copy result back to host
+  checkCudaErrors(cudaMemcpy(cuda_result.data(), d_result,
+                             n * n * sizeof(float), cudaMemcpyDeviceToHost));
+
+  cublasDestroy(handle);
+  return cuda_result;
+}
+
+void diff_with_cublas(const vector<float> &m1, const vector<float> &m2, int n,
+                      const vector<float> result, string name) {
+  vector<float> cublas_result = cublas_matrix_multiply_and_return(m1, m2, n);
+
+  const float epsilon = 1e-2f;
+  for (int i = 0; i < n * n; ++i) {
+    if (std::abs(cublas_result[i] - result[i]) > epsilon) {
+      cerr << "Significant mismatch at index " << i
+           << ": cublas = " << cublas_result[i] << ", " << name << " = "
+           << result[i] << '\n';
+      throw runtime_error("Significant mismatch between blas and " + name +
+                          " implementations");
+    }
+  }
 }
 
 __global__ void naive_matrix_multiply_kernel(float *m1, float *m2,
@@ -61,9 +109,7 @@ void measure_naive(const vector<float> &m1, const vector<float> &m2, int size,
                (size + blockDim.y - 1) / blockDim.y);
 
   if (size < 5000) {
-    // Check if lines up with CUDA implementation up to floating point error
-    vector<float> blas_result = blas_matrix_multiply(m1, m2, size);
-    vector<float> cuda_result(size * size);
+    vector<float> result(size * size);
 
     // Run CUDA kernel
     naive_matrix_multiply_kernel<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
@@ -72,20 +118,11 @@ void measure_naive(const vector<float> &m1, const vector<float> &m2, int size,
     checkCudaErrors(cudaDeviceSynchronize());
 
     // Copy result back to host
-    checkCudaErrors(cudaMemcpy(cuda_result.data(), d_result,
+    checkCudaErrors(cudaMemcpy(result.data(), d_result,
                                size * size * sizeof(float),
                                cudaMemcpyDeviceToHost));
 
-    const float epsilon = 1e-2f;
-    for (int i = 0; i < size * size; ++i) {
-      if (std::abs(blas_result[i] - cuda_result[i]) > epsilon) {
-        cerr << "Significant mismatch at index " << i
-             << ": blas = " << blas_result[i] << ", cuda = " << cuda_result[i]
-             << '\n';
-        throw runtime_error(
-            "Significant mismatch between blas and naive implementations");
-      }
-    }
+    diff_with_cublas(m1, m2, size, result, "naive_cuda");
   }
 
   // Warmup
@@ -116,7 +153,7 @@ void measure_naive(const vector<float> &m1, const vector<float> &m2, int size,
 }
 
 __global__ void naive_matrix_multiply_kernel2(float *m1, float *m2,
-                                             float *result, int n) {
+                                              float *result, int n) {
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int x = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -130,7 +167,7 @@ __global__ void naive_matrix_multiply_kernel2(float *m1, float *m2,
 }
 
 void measure_naive2(const vector<float> &m1, const vector<float> &m2, int size,
-                   int runs) {
+                    int runs) {
   // Transfer matrices to device
   float *d_m1, *d_m2, *d_result;
   checkCudaErrors(cudaMalloc(&d_m1, size * size * sizeof(float)));
@@ -147,37 +184,23 @@ void measure_naive2(const vector<float> &m1, const vector<float> &m2, int size,
                (size + blockDim.y - 1) / blockDim.y);
 
   if (size < 5000) {
-    // Check if lines up with CUDA implementation up to floating point error
-    vector<float> blas_result = blas_matrix_multiply(m1, m2, size);
-    vector<float> cuda_result(size * size);
+    vector<float> result(size * size);
 
-    // Run CUDA kernel
     naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                        size);
+                                                         size);
     checkCudaErrors(cudaPeekAtLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-
-    // Copy result back to host
-    checkCudaErrors(cudaMemcpy(cuda_result.data(), d_result,
+    checkCudaErrors(cudaMemcpy(result.data(), d_result,
                                size * size * sizeof(float),
                                cudaMemcpyDeviceToHost));
 
-    const float epsilon = 1e-2f;
-    for (int i = 0; i < size * size; ++i) {
-      if (std::abs(blas_result[i] - cuda_result[i]) > epsilon) {
-        cerr << "Significant mismatch at index " << i
-             << ": blas = " << blas_result[i] << ", cuda = " << cuda_result[i]
-             << '\n';
-        throw runtime_error(
-            "Significant mismatch between blas and naive implementations");
-      }
-    }
+    diff_with_cublas(m1, m2, size, result, "naive_cuda2");
   }
 
   // Warmup
   for (int i = 0; i < 10; ++i) {
     naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                        size);
+                                                         size);
     checkCudaErrors(cudaPeekAtLastError());
     checkCudaErrors(cudaDeviceSynchronize());
   }
@@ -185,7 +208,7 @@ void measure_naive2(const vector<float> &m1, const vector<float> &m2, int size,
   for (int i = 0; i < runs; ++i) {
     auto start_time = chrono::high_resolution_clock::now();
     naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
-                                                        size);
+                                                         size);
     checkCudaErrors(cudaPeekAtLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     auto end_time = chrono::high_resolution_clock::now();
@@ -249,9 +272,7 @@ void measure_tiled(const vector<float> &m1, const vector<float> &m2, int size,
   size_t shared_mem_size = tile_size * tile_size * sizeof(float) * 2;
 
   if (size < 5000) {
-    // Check if lines up with CUDA implementation up to floating point error
-    vector<float> blas_result = blas_matrix_multiply(m1, m2, size);
-    vector<float> cuda_result(size * size);
+    vector<float> result(size * size);
 
     // Run CUDA kernel
     tiled_matrix_multiply_kernel<<<gridDim, blockDim, shared_mem_size>>>(
@@ -260,20 +281,12 @@ void measure_tiled(const vector<float> &m1, const vector<float> &m2, int size,
     checkCudaErrors(cudaDeviceSynchronize());
 
     // Copy result back to host
-    checkCudaErrors(cudaMemcpy(cuda_result.data(), d_result,
+    checkCudaErrors(cudaMemcpy(result.data(), d_result,
                                size * size * sizeof(float),
                                cudaMemcpyDeviceToHost));
 
-    const float epsilon = 1e-2f;
-    for (int i = 0; i < size * size; ++i) {
-      if (std::abs(blas_result[i] - cuda_result[i]) > epsilon) {
-        cerr << "Significant mismatch at index " << i
-             << ": blas = " << blas_result[i] << ", cuda = " << cuda_result[i]
-             << '\n';
-        throw runtime_error(
-            "Significant mismatch between blas and tiled implementations");
-      }
-    }
+    diff_with_cublas(m1, m2, size, result,
+                     "tiled_cuda(tile_size=" + to_string(tile_size) + ")");
   }
 
   // Warmup
@@ -304,6 +317,37 @@ void measure_tiled(const vector<float> &m1, const vector<float> &m2, int size,
   checkCudaErrors(cudaFree(d_result));
 }
 
+void measure_cublas(const vector<float> &m1, const vector<float> &m2, int size,
+                    int runs) {
+  cublasHandle_t handle;
+  checkCublasErrors(cublasCreate(&handle));
+
+  float *d_m1, *d_m2, *d_result;
+  checkCudaErrors(cudaMalloc(&d_m1, size * size * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_m2, size * size * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_result, size * size * sizeof(float)));
+  checkCudaErrors(cudaMemcpy(d_m1, m1.data(), size * size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(d_m2, m2.data(), size * size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  // Warmup
+  for (int i = 0; i < 10; ++i) {
+    cublas_matrix_multiply(handle, d_m1, d_m2, d_result, size);
+  }
+
+  for (int i = 0; i < runs; ++i) {
+    auto start_time = chrono::high_resolution_clock::now();
+    cublas_matrix_multiply(handle, d_m1, d_m2, d_result, size);
+    auto end_time = chrono::high_resolution_clock::now();
+    auto duration =
+        chrono::duration_cast<chrono::microseconds>(end_time - start_time)
+            .count();
+    cout << size << "," << i + 1 << "," << duration << ",cublas" << endl;
+  }
+
+  cublasDestroy(handle);
+}
+
 int main(int argc, char *argv[]) {
   if (argc != 3) {
     cerr << "Usage: " << argv[0] << " <size> <runs>\n";
@@ -330,6 +374,7 @@ int main(int argc, char *argv[]) {
     measure_tiled(m1, m2, size, runs, 8);
     measure_tiled(m1, m2, size, runs, 16);
     measure_tiled(m1, m2, size, runs, 32);
+    measure_cublas(m1, m2, size, runs);
   } catch (const exception &e) {
     cerr << "Error: " << e.what() << '\n';
     return EXIT_FAILURE;
