@@ -1,23 +1,17 @@
-naive: naive.cpp
-	g++ -O3 -march=native -o naive naive.cpp
+cpu: cpu.cpp
+	g++ -O3 -march=native -fopenmp -o cpu cpu.cpp -lblas
 
-openmp: openmp.cpp
-	g++ -O3 -march=native -fopenmp -o openmp openmp.cpp
+gpu: gpu.cu
+	nvcc -O3 -o gpu gpu.cu -lblas
 
-blas: blas.cpp
-	g++ -O3 -march=native -o blas blas.cpp -lblas
-
-naive-cuda: naive-cuda.cu
-	nvcc -O3 -o naive-cuda naive-cuda.cu
-
-tiled-cuda: tiled.cu
-	nvcc -O3 -o tiled-cuda tiled.cu
+query-gpu: query-gpu.cu
+	nvcc -o query-gpu query-gpu.cu
 
 .PHONY: clean all format
 
-all: naive openmp blas naive-cuda tiled-cuda
+all: cpu gpu query-gpu
 
 format:
 	clang-format -i -style=Google *.cpp *.cu
 clean:
-	rm -f naive openmp blas naive-cuda tiled-cuda
+	rm -f cpu gpu query-gpu

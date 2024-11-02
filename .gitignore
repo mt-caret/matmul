@@ -1,8 +1,5 @@
-blas
-conda-env
-naive
-naive-cuda
-openmp
-tiled-cuda
-__pycache__
 .ipynb_checkpoints
+__pycache__
+conda-env
+cpu
+gpu
