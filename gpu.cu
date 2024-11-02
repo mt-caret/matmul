@@ -29,15 +29,17 @@ vector<float> blas_matrix_multiply(const vector<float> &m1,
 
 __global__ void naive_matrix_multiply_kernel(float *m1, float *m2,
                                              float *result, int n) {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  // Note x and y are swapped; this causes less coalescing within a warp,
+  // slowing the kernel down compared to naive_matrix_multiply_kernel2
+  int x = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (row < n && col < n) {
+  if (y < n && x < n) {
     float sum = 0;
     for (int k = 0; k < n; ++k) {
-      sum += m1[row * n + k] * m2[k * n + col];
+      sum += m1[y * n + k] * m2[k * n + x];
     }
-    result[row * n + col] = sum;
+    result[y * n + x] = sum;
   }
 }
 
@@ -105,6 +107,92 @@ void measure_naive(const vector<float> &m1, const vector<float> &m2, int size,
         chrono::duration_cast<chrono::microseconds>(end_time - start_time)
             .count();
     cout << size << "," << i + 1 << "," << duration << ",naive_cuda" << endl;
+  }
+
+  // Clean up
+  checkCudaErrors(cudaFree(d_m1));
+  checkCudaErrors(cudaFree(d_m2));
+  checkCudaErrors(cudaFree(d_result));
+}
+
+__global__ void naive_matrix_multiply_kernel2(float *m1, float *m2,
+                                             float *result, int n) {
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (y < n && x < n) {
+    float sum = 0;
+    for (int k = 0; k < n; ++k) {
+      sum += m1[y * n + k] * m2[k * n + x];
+    }
+    result[y * n + x] = sum;
+  }
+}
+
+void measure_naive2(const vector<float> &m1, const vector<float> &m2, int size,
+                   int runs) {
+  // Transfer matrices to device
+  float *d_m1, *d_m2, *d_result;
+  checkCudaErrors(cudaMalloc(&d_m1, size * size * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_m2, size * size * sizeof(float)));
+  checkCudaErrors(cudaMalloc(&d_result, size * size * sizeof(float)));
+  checkCudaErrors(cudaMemcpy(d_m1, m1.data(), size * size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(d_m2, m2.data(), size * size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+
+  // Define grid and block dimensions
+  dim3 blockDim(32, 32);
+  dim3 gridDim((size + blockDim.x - 1) / blockDim.x,
+               (size + blockDim.y - 1) / blockDim.y);
+
+  if (size < 5000) {
+    // Check if lines up with CUDA implementation up to floating point error
+    vector<float> blas_result = blas_matrix_multiply(m1, m2, size);
+    vector<float> cuda_result(size * size);
+
+    // Run CUDA kernel
+    naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
+                                                        size);
+    checkCudaErrors(cudaPeekAtLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // Copy result back to host
+    checkCudaErrors(cudaMemcpy(cuda_result.data(), d_result,
+                               size * size * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+
+    const float epsilon = 1e-2f;
+    for (int i = 0; i < size * size; ++i) {
+      if (std::abs(blas_result[i] - cuda_result[i]) > epsilon) {
+        cerr << "Significant mismatch at index " << i
+             << ": blas = " << blas_result[i] << ", cuda = " << cuda_result[i]
+             << '\n';
+        throw runtime_error(
+            "Significant mismatch between blas and naive implementations");
+      }
+    }
+  }
+
+  // Warmup
+  for (int i = 0; i < 10; ++i) {
+    naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
+                                                        size);
+    checkCudaErrors(cudaPeekAtLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+  }
+
+  for (int i = 0; i < runs; ++i) {
+    auto start_time = chrono::high_resolution_clock::now();
+    naive_matrix_multiply_kernel2<<<gridDim, blockDim>>>(d_m1, d_m2, d_result,
+                                                        size);
+    checkCudaErrors(cudaPeekAtLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+    auto end_time = chrono::high_resolution_clock::now();
+    auto duration =
+        chrono::duration_cast<chrono::microseconds>(end_time - start_time)
+            .count();
+    cout << size << "," << i + 1 << "," << duration << ",naive_cuda2" << endl;
   }
 
   // Clean up
@@ -238,6 +326,7 @@ int main(int argc, char *argv[]) {
 
     cout << "size,run,runtime_us,method" << endl;
     measure_naive(m1, m2, size, runs);
+    measure_naive2(m1, m2, size, runs);
     measure_tiled(m1, m2, size, runs, 8);
     measure_tiled(m1, m2, size, runs, 16);
     measure_tiled(m1, m2, size, runs, 32);
